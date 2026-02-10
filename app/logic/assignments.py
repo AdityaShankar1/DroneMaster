@@ -1,136 +1,130 @@
 import pandas as pd
-from typing import Tuple, List
 
+PRIORITY_BONUS = {
+    "Urgent": 50,
+    "High": 30,
+    "Standard": 0
+}
 
-PRIORITY_ORDER = {
-    "Urgent": 3,
-    "High": 2,
-    "Standard": 1
+PENALTIES = {
+    "location_mismatch": -20,
+    "missing_skill": -30,
+    "missing_cert": -40,
+    "capability_mismatch": -30
 }
 
 
-def normalize_list(val):
-    if pd.isna(val):
-        return set()
-    return {v.strip().lower() for v in str(val).split(",")}
+def _split(val):
+    if pd.isna(val) or val == "–":
+        return []
+    return [v.strip() for v in str(val).split(",")]
 
 
-def match_missions(
-    pilots: pd.DataFrame,
-    drones: pd.DataFrame,
-    missions: pd.DataFrame
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def score_pilot(pilot, mission):
+    score = 0
+    reasons = []
 
+    if pilot["location"] != mission["location"]:
+        score += PENALTIES["location_mismatch"]
+        reasons.append("pilot location mismatch")
+
+    pilot_skills = _split(pilot["skills"])
+    required_skills = _split(mission["required_skills"])
+    if not set(required_skills).issubset(set(pilot_skills)):
+        score += PENALTIES["missing_skill"]
+        reasons.append("missing required skill")
+
+    pilot_certs = _split(pilot["certifications"])
+    required_certs = _split(mission["required_certs"])
+    if not set(required_certs).issubset(set(pilot_certs)):
+        score += PENALTIES["missing_cert"]
+        reasons.append("missing required certification")
+
+    return score, reasons
+
+
+def score_drone(drone, mission):
+    score = 0
+    reasons = []
+
+    if drone["status"] == "Maintenance":
+        return None, ["drone under maintenance"]
+
+    drone_caps = _split(drone["capabilities"])
+    required_skills = _split(mission["required_skills"])
+    if not set(required_skills).issubset(set(drone_caps)):
+        score += PENALTIES["capability_mismatch"]
+        reasons.append("drone capability mismatch")
+
+    if drone["location"] != mission["location"]:
+        score += PENALTIES["location_mismatch"]
+        reasons.append("drone location mismatch")
+
+    return score, reasons
+
+
+def match_missions(pilots, drones, missions):
     assignments = []
     conflicts = []
 
-    pilots = pilots.copy()
-    drones = drones.copy()
     missions = missions.copy()
-
-    # Track consumption
-    pilots["__assigned"] = False
-    drones["__assigned"] = False
-
-    # Priority-aware ordering
-    missions["__priority_score"] = missions["priority"].map(PRIORITY_ORDER).fillna(0)
-    missions = missions.sort_values(
-        by=["__priority_score", "start_date"],
-        ascending=[False, True]
+    missions["priority_rank"] = missions["priority"].map(
+        {"Urgent": 0, "High": 1, "Standard": 2}
     )
+    missions = missions.sort_values("priority_rank")
+
+    used_pilots = set()
+    used_drones = set()
 
     for _, mission in missions.iterrows():
-        mission_id = mission["project_id"]
-        location = mission["location"].lower()
-        req_skills = normalize_list(mission["required_skills"])
-        req_certs = normalize_list(mission["required_certs"])
-
-        eligible_pilots = []
-        pilot_reasons = []
+        best = None
+        best_score = float("-inf")
+        best_reasons = []
 
         for _, pilot in pilots.iterrows():
-            if pilot["__assigned"]:
-                pilot_reasons.append(
-                    f"{pilot['pilot_id']}: already assigned to higher-priority mission"
-                )
+            if pilot["pilot_id"] in used_pilots:
+                continue
+            if pilot["status"] != "Available":
                 continue
 
-            reasons = []
+            pilot_score, pilot_reasons = score_pilot(pilot, mission)
 
-            if pilot["location"].lower() != location:
-                reasons.append("location mismatch")
+            for _, drone in drones.iterrows():
+                if drone["drone_id"] in used_drones:
+                    continue
 
-            if not req_skills.issubset(normalize_list(pilot["skills"])):
-                reasons.append("missing required skills")
+                drone_score, drone_reasons = score_drone(drone, mission)
+                if drone_score is None:
+                    continue  # hard fail
 
-            if not req_certs.issubset(normalize_list(pilot["certifications"])):
-                reasons.append("missing required certifications")
-
-            if pilot["status"].lower() != "available":
-                reasons.append("not available")
-
-            if reasons:
-                pilot_reasons.append(f"{pilot['pilot_id']}: {', '.join(reasons)}")
-            else:
-                eligible_pilots.append(pilot)
-
-        if not eligible_pilots:
-            conflicts.append({
-                "mission": mission_id,
-                "type": "No eligible pilot",
-                "reason": "; ".join(pilot_reasons)
-            })
-            continue
-
-        eligible_drones = []
-        drone_reasons = []
-
-        for _, drone in drones.iterrows():
-            if drone["__assigned"]:
-                drone_reasons.append(
-                    f"{drone['drone_id']}: already assigned to higher-priority mission"
+                total_score = (
+                    pilot_score
+                    + drone_score
+                    + PRIORITY_BONUS.get(mission["priority"], 0)
                 )
-                continue
 
-            reasons = []
+                if total_score > best_score:
+                    best_score = total_score
+                    best = (pilot, drone)
+                    best_reasons = pilot_reasons + drone_reasons
 
-            if drone["location"].lower() != location:
-                reasons.append("location mismatch")
+        if best and best_score >= 0:
+            pilot, drone = best
+            used_pilots.add(pilot["pilot_id"])
+            used_drones.add(drone["drone_id"])
 
-            if not req_skills.intersection(normalize_list(drone["capabilities"])):
-                reasons.append("capability mismatch")
-
-            if drone["status"].lower() != "available":
-                reasons.append("not available")
-
-            if reasons:
-                drone_reasons.append(f"{drone['drone_id']}: {', '.join(reasons)}")
-            else:
-                eligible_drones.append(drone)
-
-        if not eligible_drones:
-            conflicts.append({
-                "mission": mission_id,
-                "type": "No eligible drone",
-                "reason": "; ".join(drone_reasons)
+            assignments.append({
+                "mission": mission["project_id"],
+                "pilot_id": pilot["pilot_id"],
+                "drone_id": drone["drone_id"],
+                "score": best_score,
+                "violations": "; ".join(best_reasons) if best_reasons else "None"
             })
-            continue
+        else:
+            conflicts.append({
+                "mission": mission["project_id"],
+                "type": "No viable assignment",
+                "reason": "All options scored below threshold"
+            })
 
-        # Assign first eligible (deterministic, explainable)
-        chosen_pilot = eligible_pilots[0]
-        chosen_drone = eligible_drones[0]
-
-        pilots.loc[pilots["pilot_id"] == chosen_pilot["pilot_id"], "__assigned"] = True
-        drones.loc[drones["drone_id"] == chosen_drone["drone_id"], "__assigned"] = True
-
-        assignments.append({
-            "mission": mission_id,
-            "pilot_id": chosen_pilot["pilot_id"],
-            "drone_id": chosen_drone["drone_id"],
-            "priority": mission["priority"]
-        })
-
-    return (
-        pd.DataFrame(assignments),
-        pd.DataFrame(conflicts)
-    )
+    return pd.DataFrame(assignments), pd.DataFrame(conflicts)

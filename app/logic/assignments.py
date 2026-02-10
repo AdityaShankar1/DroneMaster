@@ -1,83 +1,76 @@
-from datetime import datetime
 import pandas as pd
-
-from app.sheets.pilot_repo import get_pilots
-from app.sheets.drone_repo import get_drones
-from app.sheets.mission_repo import get_missions
+from typing import Tuple, List
 
 
-def parse_date(d):
-    return datetime.strptime(d, "%Y-%m-%d")
+PRIORITY_ORDER = {
+    "Urgent": 3,
+    "High": 2,
+    "Standard": 1
+}
 
 
-def date_overlap(start1, end1, start2, end2):
-    return not (end1 < start2 or end2 < start1)
+def normalize_list(val):
+    if pd.isna(val):
+        return set()
+    return {v.strip().lower() for v in str(val).split(",")}
 
 
-def match_missions(pilots: pd.DataFrame,
-                   drones: pd.DataFrame,
-                   missions: pd.DataFrame):
+def match_missions(
+    pilots: pd.DataFrame,
+    drones: pd.DataFrame,
+    missions: pd.DataFrame
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
     assignments = []
     conflicts = []
 
-    pilot_assignments = {}   # pilot_id -> (start, end)
-    drone_assignments = {}   # drone_id -> (start, end)
+    pilots = pilots.copy()
+    drones = drones.copy()
+    missions = missions.copy()
+
+    # Track consumption
+    pilots["__assigned"] = False
+    drones["__assigned"] = False
+
+    # Priority-aware ordering
+    missions["__priority_score"] = missions["priority"].map(PRIORITY_ORDER).fillna(0)
+    missions = missions.sort_values(
+        by=["__priority_score", "start_date"],
+        ascending=[False, True]
+    )
 
     for _, mission in missions.iterrows():
         mission_id = mission["project_id"]
-        mission_loc = mission["location"]
-        mission_start = parse_date(mission["start_date"])
-        mission_end = parse_date(mission["end_date"])
-
-        required_skills = {
-            s.strip().lower()
-            for s in mission["required_skills"].split(",")
-        }
-        required_certs = {
-            c.strip().lower()
-            for c in mission["required_certs"].split(",")
-        }
+        location = mission["location"].lower()
+        req_skills = normalize_list(mission["required_skills"])
+        req_certs = normalize_list(mission["required_certs"])
 
         eligible_pilots = []
-        pilot_rejection_reasons = []
+        pilot_reasons = []
 
         for _, pilot in pilots.iterrows():
+            if pilot["__assigned"]:
+                pilot_reasons.append(
+                    f"{pilot['pilot_id']}: already assigned to higher-priority mission"
+                )
+                continue
+
             reasons = []
 
-            if pilot["location"] != mission_loc:
+            if pilot["location"].lower() != location:
                 reasons.append("location mismatch")
 
-            pilot_skills = {
-                s.strip().lower()
-                for s in pilot["skills"].split(",")
-            }
-            if not required_skills.issubset(pilot_skills):
+            if not req_skills.issubset(normalize_list(pilot["skills"])):
                 reasons.append("missing required skills")
 
-            pilot_certs = {
-                c.strip().lower()
-                for c in pilot["certifications"].split(",")
-            }
-            if not required_certs.issubset(pilot_certs):
+            if not req_certs.issubset(normalize_list(pilot["certifications"])):
                 reasons.append("missing required certifications")
 
-            available_from = parse_date(pilot["available_from"])
-            if available_from > mission_start:
-                reasons.append("not available on start date")
-
-            pid = pilot["pilot_id"]
-            if pid in pilot_assignments:
-                assigned_start, assigned_end = pilot_assignments[pid]
-                if date_overlap(
-                    mission_start, mission_end,
-                    assigned_start, assigned_end
-                ):
-                    reasons.append("pilot already assigned during mission window")
+            if pilot["status"].lower() != "available":
+                reasons.append("not available")
 
             if reasons:
-                pilot_rejection_reasons.append(
-                    f"{pid}: {', '.join(reasons)}"
-                )
+                pilot_reasons.append(f"{pilot['pilot_id']}: {', '.join(reasons)}")
             else:
                 eligible_pilots.append(pilot)
 
@@ -85,45 +78,33 @@ def match_missions(pilots: pd.DataFrame,
             conflicts.append({
                 "mission": mission_id,
                 "type": "No eligible pilot",
-                "reason": "; ".join(pilot_rejection_reasons)
+                "reason": "; ".join(pilot_reasons)
             })
             continue
 
-        pilot = eligible_pilots[0]
-        pid = pilot["pilot_id"]
-
         eligible_drones = []
-        drone_rejection_reasons = []
+        drone_reasons = []
 
         for _, drone in drones.iterrows():
+            if drone["__assigned"]:
+                drone_reasons.append(
+                    f"{drone['drone_id']}: already assigned to higher-priority mission"
+                )
+                continue
+
             reasons = []
 
-            if drone["location"] != mission_loc:
+            if drone["location"].lower() != location:
                 reasons.append("location mismatch")
 
-            if drone["status"].lower() != "available":
-                reasons.append("drone not available")
-
-            drone_caps = {
-                c.strip().lower()
-                for c in drone["capabilities"].split(",")
-            }
-            if not required_skills.issubset(drone_caps):
+            if not req_skills.intersection(normalize_list(drone["capabilities"])):
                 reasons.append("capability mismatch")
 
-            did = drone["drone_id"]
-            if did in drone_assignments:
-                assigned_start, assigned_end = drone_assignments[did]
-                if date_overlap(
-                    mission_start, mission_end,
-                    assigned_start, assigned_end
-                ):
-                    reasons.append("drone already assigned during mission window")
+            if drone["status"].lower() != "available":
+                reasons.append("not available")
 
             if reasons:
-                drone_rejection_reasons.append(
-                    f"{did}: {', '.join(reasons)}"
-                )
+                drone_reasons.append(f"{drone['drone_id']}: {', '.join(reasons)}")
             else:
                 eligible_drones.append(drone)
 
@@ -131,34 +112,25 @@ def match_missions(pilots: pd.DataFrame,
             conflicts.append({
                 "mission": mission_id,
                 "type": "No eligible drone",
-                "reason": "; ".join(drone_rejection_reasons)
+                "reason": "; ".join(drone_reasons)
             })
             continue
 
-        drone = eligible_drones[0]
-        did = drone["drone_id"]
+        # Assign first eligible (deterministic, explainable)
+        chosen_pilot = eligible_pilots[0]
+        chosen_drone = eligible_drones[0]
+
+        pilots.loc[pilots["pilot_id"] == chosen_pilot["pilot_id"], "__assigned"] = True
+        drones.loc[drones["drone_id"] == chosen_drone["drone_id"], "__assigned"] = True
 
         assignments.append({
             "mission": mission_id,
-            "pilot_id": pid,
-            "drone_id": did
+            "pilot_id": chosen_pilot["pilot_id"],
+            "drone_id": chosen_drone["drone_id"],
+            "priority": mission["priority"]
         })
 
-        pilot_assignments[pid] = (mission_start, mission_end)
-        drone_assignments[did] = (mission_start, mission_end)
-
-    return pd.DataFrame(assignments), pd.DataFrame(conflicts)
-
-
-if __name__ == "__main__":
-    pilots = get_pilots()
-    drones = get_drones()
-    missions = get_missions()
-
-    assignments, conflicts = match_missions(pilots, drones, missions)
-
-    print("Assignments:")
-    print(assignments)
-
-    print("\nConflicts:")
-    print(conflicts)
+    return (
+        pd.DataFrame(assignments),
+        pd.DataFrame(conflicts)
+    )

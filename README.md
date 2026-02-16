@@ -10,6 +10,7 @@ The system emphasizes:
 - Enterprise-readiness
 
 Inspired by real-world drone operations at scale.
+Mock Data provided by Skylark Drones
 
 ---
 
@@ -80,6 +81,9 @@ This project models how real enterprise drone platforms:
 
 ---
 
-## Status
-Backend complete.  
-Frontend MVP in progress.
+## 📜 License & Usage
+This project is licensed under the MIT License.
+
+### Note to Fellow Developers: 
+I built this in a 6-hour sprint for a technical assessment. I've since improved it and added my own spin. Feel free to use this in your own portfolio or as a reference! All I ask is that you keep the original attribution in the LICENSE file and perhaps link back to this repo (I'd really appreciate that). 
+Let's keep the dev community supportive!
